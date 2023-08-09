@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 
-from app.core import run_pipeline
+from app.core import run_yolov5_detection_pipeline as run_pipeline
 
 
 if __name__ == '__main__':

@@ -1,0 +1,52 @@
+# tf_gpu_memory_fraction: 0.2 is specified for device with limited memory
+# resource such as Nano. Smaller value can limit Tensorflow GPU usage;
+# and larger value may increase performance but may also cause Out-Of-Memory
+# issues. Please tune a proper value.
+
+infer_config {
+  unique_id: 1
+  gpu_ids: [0]
+  backend {
+    triton {
+      model_name: "yolov5s_onnx"
+      version: 1
+      model_repo {
+        root: "/usr/src/deepstream-python/deepstream/configs/triton/yolov5"
+        log_level: 2
+        tf_gpu_memory_fraction: 1.0
+        tf_disable_soft_placement: 0
+      }
+    }
+  }
+
+  preprocess {
+    network_format: IMAGE_FORMAT_RGB
+    tensor_order: TENSOR_ORDER_LINEAR
+    maintain_aspect_ratio: 1
+    frame_scaling_hw: FRAME_SCALING_HW_DEFAULT
+    frame_scaling_filter: 1
+    symmetric_padding: 1
+    normalize {
+      scale_factor: 0.0039215697906911373
+      channel_offsets: [0, 0, 0]
+    }
+  }
+
+  postprocess {
+    labelfile_path: "/usr/src/deepstream-python/deepstream/configs/classnames/coco.txt"
+    other {}
+  }
+
+  extra {
+    copy_input_to_host_buffers: false
+  }
+
+}
+
+input_control {
+  process_mode: PROCESS_MODE_FULL_FRAME
+  interval: 0
+}
+output_control {
+  output_tensor_meta: true
+}

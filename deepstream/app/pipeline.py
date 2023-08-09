@@ -7,7 +7,7 @@ import logging
 import configparser
 from functools import partial
 from inspect import signature
-from typing import List
+from typing import List, Optional, Callable
 from collections import defaultdict
 
 import cv2
@@ -25,6 +25,7 @@ from app.utils.bus_call import bus_call
 from app.utils.is_aarch_64 import is_aarch64
 from app.utils.fps import FPSMonitor
 from app.utils.bbox import rect_params_to_coords
+from app.utils.misc import long_to_uint64, img2base64
 from app.config import CONFIGS_DIR, OUTPUT_DIR, CROPS_DIR
 
 PGIE_CLASS_ID_VEHICLE = 2
@@ -35,12 +36,24 @@ TILED_OUTPUT_HEIGHT = 1080
 
 class Pipeline:
 
-    def __init__(self, *, video_uri: str, output_video_path: str = None,
-                 pgie_config_path: str = os.path.join(CONFIGS_DIR, "pgies/pgie.txt"),
-                 tracker_config_path: str = os.path.join(CONFIGS_DIR, "trackers/nvdcf.txt"),
-                 enable_osd: bool = True, write_osd_analytics: bool = True,
-                 save_crops: bool = False, output_format: str = "mp4", rtsp_codec: str = "H265",
-                 input_shape: tuple = (1920, 1080)):
+    def __init__(
+        self,
+        *,
+        video_uri: str,
+        output_video_path: str = None,
+        pgie_config_path: str = os.path.join(CONFIGS_DIR, "pgies/pgie.txt"),
+        tracker_config_path: Optional[str] = os.path.join(CONFIGS_DIR, "trackers/nvdcf.txt"),
+        msgconv_config_path: Optional[str] = os.path.join(CONFIGS_DIR, "msgconv/msgconv_config.txt"),
+        msgbroker_config_path: Optional[str] = os.path.join(CONFIGS_DIR, "db/redis_config.txt"),
+        send_data_to_cloud: bool = True,
+        enable_osd: bool = True,
+        write_osd_analytics: bool = True,
+        save_crops: bool = False,
+        output_format: str = "mp4",
+        rtsp_codec: str = "H265",
+        input_shape: tuple = (1920, 1080),
+        max_timestamp_len: int = 32,
+    ):
         """Create a Deepstream Pipeline.
 
         Args:
@@ -62,6 +75,7 @@ class Pipeline:
         self.pgie_config_path = pgie_config_path
         self.tracker_config_path = tracker_config_path
         self.enable_osd = enable_osd
+        self.send_data_to_cloud = send_data_to_cloud
         self.write_osd_analytics = write_osd_analytics
         self.save_crops = save_crops
         self.output_format = output_format
@@ -71,6 +85,9 @@ class Pipeline:
         self.input_height = self.input_shape[1]
         self.num_sources = 1  # TODO: to support multiple sources in the future
         self.fps_streams = {}
+        self.max_timestamp_len = max_timestamp_len
+        self.msgconv_config_path = msgconv_config_path
+        self.msgbroker_config_path = msgbroker_config_path
 
         for i in range(self.num_sources):
             self.fps_streams[f"stream{i}"] = FPSMonitor(i)
@@ -102,6 +119,12 @@ class Pipeline:
         self.nvosd = None
         self.queue1 = None
         self.sink_bin = None
+        self.msgconv = None
+        self.msgbroker = None
+
+        # registering callbacks
+        pyds.register_user_copyfunc(self._meta_copy_func)
+        pyds.register_user_releasefunc(self._meta_free_func)
 
         self._create_elements()
         self._link_elements()
@@ -110,15 +133,16 @@ class Pipeline:
     def __str__(self):
         return " -> ".join([elm.name for elm in self.elements])
 
-    def _add_element(self, element, idx=None):
-        if idx:
-            self.elements.insert(idx, element)
-        else:
-            self.elements.append(element)
+    def _add_element(self, element, idx=None, add_to_elements: bool=True):
+        if add_to_elements:
+            if idx:
+                self.elements.insert(idx, element)
+            else:
+                self.elements.append(element)
 
         self.pipeline.add(element)
 
-    def _create_element(self, factory_name, name, print_name, detail="", add=True):
+    def _create_element(self, factory_name, name, print_name, detail="", add: bool=True, add_to_elements: bool=True):
         """Creates an element with Gst Element Factory make.
 
         Return the element if successfully created, otherwise print to stderr and return None.
@@ -132,7 +156,7 @@ class Pipeline:
                 self.logger.error(detail)
 
         if add:
-            self._add_element(elm)
+            self._add_element(elm, add_to_elements=add_to_elements)
 
         return elm
 
@@ -313,10 +337,9 @@ class Pipeline:
                                       f"{self.rtsp_codec} rtppay", add=False)
 
         # Make the UDP sink
-        updsink_port_num = 5400
         sink = self._create_element("udpsink", "udpsink", "UDP sink", add=False)
         sink.set_property('host', '224.224.255.255')
-        sink.set_property('port', updsink_port_num)
+        sink.set_property('port', 5400)
         sink.set_property('async', False)
         sink.set_property('sync', 1)
 
@@ -331,14 +354,31 @@ class Pipeline:
         self._add_element(rtsp_sink_bin)
 
         return rtsp_sink_bin
+    
+    def _create_msgbroker(self):
+        msgbroker = self._create_element("nvmsgbroker", "nvmsg-broker", "MSGbroker", add=True, add_to_elements=False)
+        msgbroker.set_property('config', self.msgbroker_config_path)
+        msgbroker.set_property('proto-lib', '/opt/nvidia/deepstream/deepstream-6.1/lib/libnvds_redis_proto.so')
+        msgbroker.set_property('conn-str', 'localhost;6379;dog')
+        msgbroker.set_property('topic', 'dog')
+
+        return msgbroker
+    
+    def _create_msgconv(self):
+        msgconv = self._create_element("nvmsgconv", "nvmsg-converter", "MSGconv", add=True, add_to_elements=False)
+        msgconv.set_property('config', self.msgconv_config_path)
+        msgconv.set_property('payload-type', 0)
+
+        return msgconv
 
     def _create_elements(self):
         self.source_bin = self._create_source_bin()
         self.streammux = self._create_streammux()
 
-        self.pgie = self._create_element("nvinfer", "primary-inference", "PGIE")
+        self.pgie = self._create_element("nvinferserver", "primary-inference", "PGIE")
         self.pgie.set_property('config-file-path', self.pgie_config_path)
-        self.tracker = self._create_tracker()
+        if self.tracker_config_path is not None:
+            self.tracker = self._create_tracker()
 
         # Use convertor to convert from NV12 to RGBA (easier to work with in Python)
         self.nvvidconv1 = self._create_element("nvvideoconvert", "convertor1", "Converter 1")
@@ -357,6 +397,15 @@ class Pipeline:
             self.sink_bin = self._create_mp4_sink_bin()
         if self.output_format.lower() == "rtsp":
             self.sink_bin = self._create_rtsp_sink_bin()
+
+        if self.msgconv_config_path is not None:
+            self.msgconv = self._create_msgconv()
+            self.queue1.link(self.msgconv)
+
+        if self.msgbroker_config_path is not None:
+            self.msgbroker = self._create_msgbroker()
+            if self.msgconv is not None:
+                self.msgconv.link(self.msgbroker)
 
         if not is_aarch64():
             # Use CUDA unified memory so frames can be easily accessed on CPU in Python.
@@ -449,7 +498,7 @@ class Pipeline:
 
                 self.track_scores[track_id].append(crop_score)
 
-    def _probe_fn_wrapper(self, _, info, probe_fn, get_frames=False):
+    def _probe_fn_wrapper(self, _, info, probe_fn: Callable, get_frames: bool = False):
         gst_buffer = info.get_buffer()
         if not gst_buffer:
             self.logger.error("Unable to get GstBuffer")
@@ -462,9 +511,21 @@ class Pipeline:
         l_frame = batch_meta.frame_meta_list
         while l_frame is not None:
             try:
+                # Note that l_frame.data needs a cast to pyds.NvDsFrameMeta
+                # The casting also keeps ownership of the underlying memory
+                # in the C code, so the Python garbage collector will leave
+                # it alone.
                 frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
             except StopIteration:
                 break
+
+            # Short example of attribute access for frame_meta:
+            # print("Frame Number is ", frame_meta.frame_num)
+            # print("Source id is ", frame_meta.source_id)
+            # print("Batch id is ", frame_meta.batch_id)
+            # print("Source Frame Width ", frame_meta.source_frame_width)
+            # print("Source Frame Height ", frame_meta.source_frame_height)
+            # print("Num object meta ", frame_meta.num_obj_meta)
 
             if get_frames:
                 frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -476,6 +537,10 @@ class Pipeline:
             l_obj = frame_meta.obj_meta_list
             while l_obj is not None:
                 try:
+                    # Note that l_obj.data needs a cast to pyds.NvDsObjectMeta
+                    # The casting also keeps ownership of the underlying memory
+                    # in the C code, so the Python garbage collector will leave
+                    # it alone.
                     obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
                 except StopIteration:
                     break
@@ -512,20 +577,166 @@ class Pipeline:
             raise AttributeError(f"Unable to get {pad_name} pad of {element.name}")
 
         return pad
+    
+    def generate_vehicle_meta(self, data, full_image):
+        obj = pyds.NvDsVehicleObject.cast(data)
+        obj.type = img2base64(full_image)
+        obj.color = "blue"
+        obj.make = "Bugatti"
+        obj.model = "M"
+        obj.license = "XX1234"
+        obj.region = "CA"
+        return obj
+    
+    def _generate_event_msg_meta(self, msg_meta, class_id, full_image):
+        meta = pyds.NvDsEventMsgMeta.cast(msg_meta)
+        meta.sensorId = 0
+        meta.placeId = 0
+        meta.moduleId = 0
+        meta.sensorStr = "sensor-0"
+        meta.ts = pyds.alloc_buffer(self.max_timestamp_len + 1)
+        pyds.generate_ts_rfc3339(meta.ts, self.max_timestamp_len)
+        # meta.objClassId = class_id
+
+        # This demonstrates how to attach custom objects.
+        # Any custom object as per requirement can be generated and attached
+        # like NvDsVehicleObject / NvDsPersonObject. Then that object should
+        # be handled in payload generator library (nvmsgconv.cpp) accordingly.
+        meta.type = pyds.NvDsEventType.NVDS_EVENT_MOVING
+        meta.objType = pyds.NvDsObjectType.NVDS_OBJECT_TYPE_VEHICLE
+        meta.objClassId = 0
+        obj = pyds.alloc_nvds_vehicle_object()
+        obj = self.generate_vehicle_meta(obj, full_image)
+        meta.extMsg = obj
+        meta.extMsgSize = sys.getsizeof(pyds.NvDsVehicleObject)
+        return meta
+
+    def _meta_copy_func(self, data, user_data):
+        """Callback function for deep-copying an NvDsEventMsgMeta struct."""
+        user_meta = pyds.NvDsUserMeta.cast(data)
+        src_meta_data = user_meta.user_meta_data
+        # Cast src_meta_data to pyds.NvDsEventMsgMeta
+        srcmeta = pyds.NvDsEventMsgMeta.cast(src_meta_data)
+        # Duplicate the memory contents of srcmeta to dstmeta
+        # First use pyds.get_ptr() to get the C address of srcmeta, then
+        # use pyds.memdup() to allocate dstmeta and copy srcmeta into it.
+        # pyds.memdup returns C address of the allocated duplicate.
+        dstmeta_ptr = pyds.memdup(pyds.get_ptr(srcmeta),
+                                sys.getsizeof(pyds.NvDsEventMsgMeta))
+        # Cast the duplicated memory to pyds.NvDsEventMsgMeta
+        dstmeta = pyds.NvDsEventMsgMeta.cast(dstmeta_ptr)
+
+        # Duplicate contents of ts field. Note that reading srcmeat.ts
+        # returns its C address. This allows to memory operations to be
+        # performed on it.
+        dstmeta.ts = pyds.memdup(srcmeta.ts, self.max_timestamp_len + 1)
+
+        # Copy the sensorStr. This field is a string property. The getter (read)
+        # returns its C address. The setter (write) takes string as input,
+        # allocates a string buffer and copies the input string into it.
+        # pyds.get_string() takes C address of a string and returns the reference
+        # to a string object and the assignment inside the binder copies content.
+        dstmeta.sensorStr = pyds.get_string(srcmeta.sensorStr)
+
+        if srcmeta.objSignature.size > 0:
+            dstmeta.objSignature.signature = pyds.memdup(
+                srcmeta.objSignature.signature, srcmeta.objSignature.size)
+            dstmeta.objSignature.size = srcmeta.objSignature.size
+
+        if srcmeta.extMsgSize > 0:
+            # Example of custom metadata
+            if srcmeta.objType == pyds.NvDsObjectType.NVDS_OBJECT_TYPE_VEHICLE:
+                srcobj = pyds.NvDsVehicleObject.cast(srcmeta.extMsg)
+                obj = pyds.alloc_nvds_vehicle_object()
+                obj.type = pyds.get_string(srcobj.type)
+                obj.make = pyds.get_string(srcobj.make)
+                obj.model = pyds.get_string(srcobj.model)
+                obj.color = pyds.get_string(srcobj.color)
+                obj.license = pyds.get_string(srcobj.license)
+                obj.region = pyds.get_string(srcobj.region)
+                dstmeta.extMsg = obj
+                dstmeta.extMsgSize = sys.getsizeof(pyds.NvDsVehicleObject)
+
+        return dstmeta
+    
+    def _meta_free_func(self, data, user_data):
+        """Callback function for freeing an NvDsEventMsgMeta instance."""
+        user_meta = pyds.NvDsUserMeta.cast(data)
+        srcmeta = pyds.NvDsEventMsgMeta.cast(user_meta.user_meta_data)
+
+        # pyds.free_buffer takes C address of a buffer and frees the memory
+        # It's a NOP if the address is NULL
+        pyds.free_buffer(srcmeta.ts)
+        pyds.free_buffer(srcmeta.sensorStr)
+
+        if srcmeta.objSignature.size > 0:
+            pyds.free_buffer(srcmeta.objSignature.signature)
+            srcmeta.objSignature.size = 0
+
+        if srcmeta.extMsgSize > 0:
+            if srcmeta.objType == pyds.NvDsObjectType.NVDS_OBJECT_TYPE_VEHICLE:
+                obj = pyds.NvDsVehicleObject.cast(srcmeta.extMsg)
+                pyds.free_buffer(obj.type)
+                pyds.free_buffer(obj.color)
+                pyds.free_buffer(obj.make)
+                pyds.free_buffer(obj.model)
+                pyds.free_buffer(obj.license)
+                pyds.free_buffer(obj.region)
+            pyds.free_gbuffer(srcmeta.extMsg)
+            srcmeta.extMsgSize = 0
+        
+    def _send_data(self, frames, batch_meta, l_frame_meta: List, ll_obj_meta: List[List]):
+        for frame, frame_meta, l_obj_meta in zip(frames, l_frame_meta, ll_obj_meta):
+            frame_number = frame_meta.frame_num
+            for obj_meta in l_obj_meta:
+                # Frequency of messages to be send will be based on use case.
+
+                # Allocating an NvDsEventMsgMeta instance and getting
+                # reference to it. The underlying memory is not manged by
+                # Python so that downstream plugins can access it. Otherwise
+                # the garbage collector will free it when this probe exits.
+                msg_meta = pyds.alloc_nvds_event_msg_meta()
+                msg_meta.bbox.top = obj_meta.rect_params.top
+                msg_meta.bbox.left = obj_meta.rect_params.left
+                msg_meta.bbox.width = obj_meta.rect_params.width
+                msg_meta.bbox.height = obj_meta.rect_params.height
+                msg_meta.frameId = frame_number
+                msg_meta.trackingId = long_to_uint64(obj_meta.object_id)
+                msg_meta.confidence = obj_meta.confidence
+                msg_meta = self._generate_event_msg_meta(msg_meta, obj_meta.class_id, frame)
+                user_event_meta = pyds.nvds_acquire_user_meta_from_pool(batch_meta)
+                if user_event_meta:
+                    user_event_meta.user_meta_data = msg_meta
+                    user_event_meta.base_meta.meta_type = pyds.NvDsMetaType.NVDS_EVENT_MSG_META
+                    # Setting callbacks in the event msg meta. The bindings
+                    # layer will wrap these callables in C functions.
+                    # Currently only one set of callbacks is supported.
+                    pyds.user_copyfunc(user_event_meta, self._meta_copy_func)
+                    pyds.user_releasefunc(user_event_meta, self._meta_free_func)
+                    pyds.nvds_add_user_meta_to_frame(frame_meta,
+                                                        user_event_meta)
+                else:
+                    print("Error in attaching event meta to buffer\n")
+
 
     def _add_probes(self):
-        tiler_sinkpad = self._get_static_pad(self.tiler)
+        tiler_sinkpad = self._get_static_pad(self.tiler, "sink")
 
         if self.enable_osd and self.write_osd_analytics:
             tiler_sinkpad.add_probe(Gst.PadProbeType.BUFFER,
                                     self._wrap_probe(self._write_osd_analytics))
 
         if self.save_crops:
-            tiler_sinkpad.add_probe(Gst.PadProbeType.BUFFER, self._wrap_probe(self._save_crops))
+            tiler_sinkpad.add_probe(Gst.PadProbeType.BUFFER,
+                                    self._wrap_probe(self._save_crops))
+
+        if self.send_data_to_cloud:
+            tiler_sinkpad.add_probe(Gst.PadProbeType.BUFFER,
+                                    self._wrap_probe(self._send_data))
 
     def release(self):
         """Release resources and cleanup."""
-        pass
+        pyds.unset_callback_funcs()
 
     def run(self):
         # Create an event loop and feed gstreamer bus messages to it
